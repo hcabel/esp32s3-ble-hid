@@ -1,7 +1,6 @@
 #![no_std]
 #![no_main]
 #![feature(type_alias_impl_trait)]
-#![feature(async_closure)]
 
 use bleps::{
     ad_structure::{
@@ -17,22 +16,17 @@ use embassy_sync::{
     blocking_mutex::raw::NoopRawMutex,
     channel::{Channel, Sender},
 };
-use embassy_time::{Duration, Timer};
-use embedded_hal_async::digital::Wait;
+use embassy_time::{Duration, Instant, Timer};
+use esp_alloc as _;
 use esp_backtrace as _;
-use esp_println::println;
-use esp_wifi::{ble::controller::asynch::BleConnector, initialize, EspWifiInitFor};
-use hal::{
-    clock::ClockControl,
-    embassy,
-    gpio::{GpioPin, Input, PullDown},
-    macros::main,
-    peripherals::*,
-    prelude::*,
-    timer::TimerGroup,
-    Rng, IO,
+use esp_hal::{
+    clock::CpuClock,
+    gpio::{Input, Pull},
+    rng::Rng,
+    timer::timg::TimerGroup,
 };
-use static_cell::make_static;
+use esp_println::{self as _, println};
+use esp_wifi::ble::controller::BleConnector;
 
 macro_rules! count {
 	() => { 0u8 };
@@ -136,43 +130,34 @@ impl KeyboardReport {
     }
 }
 
-#[main]
+#[esp_hal_embassy::main]
 async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
 
-    let peripherals = Peripherals::take();
+    let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
 
-    let system = peripherals.SYSTEM.split();
-    let clocks = ClockControl::max(system.clock_control).freeze();
-
+    esp_alloc::heap_allocator!(72 * 1024);
     let rng = Rng::new(peripherals.RNG);
-    let timer = hal::systimer::SystemTimer::new(peripherals.SYSTIMER).alarm0;
-    let init = initialize(
-        EspWifiInitFor::Ble,
-        timer,
-        rng.clone(),
-        system.radio_clock_control,
-        &clocks,
-    )
-    .unwrap();
+    let timer_group0 = TimerGroup::new(peripherals.TIMG0);
+    let init = esp_wifi::init(timer_group0.timer0, rng.clone(), peripherals.RADIO_CLK).unwrap();
 
-    let mut rng_wrap = RngWrapper { rng: rng };
+    let mut rng_wrap = RngWrapper { rng };
 
-    let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
-    let button = io.pins.gpio9.into_pull_down_input();
+    let button = Input::new(peripherals.GPIO9, Pull::Down);
 
     // Async requires the GPIO interrupt to wake futures
-    hal::interrupt::enable(
-        hal::peripherals::Interrupt::GPIO,
-        hal::interrupt::Priority::Priority1,
+    esp_hal::interrupt::enable(
+        esp_hal::peripherals::Interrupt::GPIO,
+        esp_hal::interrupt::Priority::Priority1,
     )
     .unwrap();
 
-    let timer_group0 = TimerGroup::new(peripherals.TIMG0, &clocks);
-    embassy::init(&clocks, timer_group0);
+    esp_hal_embassy::init(timer_group0.timer1);
 
     let channel: Channel<NoopRawMutex, u8, 3> = Channel::new();
-    let channel = make_static!(channel);
+    static STATIC_CELL: static_cell::StaticCell<Channel<NoopRawMutex, u8, 3>> =
+        static_cell::StaticCell::new();
+    let channel = STATIC_CELL.uninit().write(channel);
 
     let receiver = channel.receiver();
     let sender = channel.sender();
@@ -182,7 +167,8 @@ async fn main(spawner: Spawner) -> ! {
     let mut bluetooth = peripherals.BT;
 
     let connector = BleConnector::new(&init, &mut bluetooth);
-    let mut ble = Ble::new(connector, esp_wifi::current_millis);
+    let now = || Instant::now().as_millis();
+    let mut ble = Ble::new(connector, now);
     println!("Connector created");
 
     let mut ltk = None;
@@ -199,7 +185,7 @@ async fn main(spawner: Spawner) -> ! {
                         ty: 0x03,
                         data: &[0x12, 0x18]
                     }, // HID
-                    AdStructure::CompleteLocalName("ESP32-C3"),
+                    AdStructure::CompleteLocalName("ESP32-S3"),
                     AdStructure::Unknown {
                         ty: 0x19,
                         data: &[0xc1, 0x03]
@@ -361,12 +347,9 @@ async fn main(spawner: Spawner) -> ! {
 }
 
 #[embassy_executor::task]
-async fn key_reader(
-    mut button: GpioPin<Input<PullDown>, 9>,
-    sender: Sender<'static, NoopRawMutex, u8, 3>,
-) {
+async fn key_reader(mut button: Input<'static>, sender: Sender<'static, NoopRawMutex, u8, 3>) {
     loop {
-        button.wait_for_rising_edge().await.ok();
+        button.wait_for_rising_edge().await;
 
         sender.send(0x08).await; // 'e'
         Timer::after(Duration::from_millis(200)).await;
